@@ -1,0 +1,107 @@
+
+from keras.models import Model
+from keras.layers import Input, Conv2D, GlobalAveragePooling2D, Dense
+from keras.layers import add, Activation, BatchNormalization
+from keras.layers.advanced_activations import LeakyReLU
+from keras.regularizers import l2
+from tensorflow_model_optimization.sparsity import keras as sparsity #addition_1
+
+pruning_params = {
+    'pruning_schedule': sparsity.PolynomialDecay(initial_sparsity=0.50,
+                                                 final_sparsity=0.90,
+                                                 begin_step=0,
+                                                 end_step=1000)
+}
+
+
+# mid level: Defining a 2D convolution operation with BNormalization and LeakyReLU
+def conv2d_unit(x, filters, kernels, strides=1):
+    x = Conv2D(filters, kernels,
+               padding='same',
+               strides=strides,
+               activation='linear',
+               kernel_regularizer=l2(5e-4))(x)
+    x = BatchNormalization()(x)
+    x = LeakyReLU(alpha=0.1)(x)
+
+    return x
+
+
+def residual_block(inputs, filters):
+    
+    x = conv2d_unit(inputs, filters, (1, 1))
+    x = conv2d_unit(x, 2 * filters, (3, 3))
+    x = add([inputs, x])
+    x = Activation('linear')(x)
+
+    return x
+
+
+def stack_residual_block(inputs, filters, n):
+    
+    x = residual_block(inputs, filters)
+
+    for i in range(n - 1):
+        x = residual_block(x, filters)
+
+    return x
+
+
+def darknet_base(inputs):
+    x = conv2d_unit(inputs, 32, (3, 3))
+
+    pruned_conv_64 = sparsity.prune_low_magnitude(
+        conv2d_unit(x, 64, (3, 3), strides=2),
+        **pruning_params
+    )
+    x = stack_residual_block(pruned_conv_64, 32, n=1)
+
+    pruned_conv_128 = sparsity.prune_low_magnitude(
+        conv2d_unit(x, 128, (3, 3), strides=2),
+        **pruning_params
+    )
+    x = stack_residual_block(pruned_conv_128, 64, n=2)
+
+    pruned_conv_256 = sparsity.prune_low_magnitude(
+        conv2d_unit(x, 256, (3, 3), strides=2),
+        **pruning_params
+    )
+    x = stack_residual_block(pruned_conv_256, 128, n=8)
+
+    pruned_conv_512 = sparsity.prune_low_magnitude(
+        conv2d_unit(x, 512, (3, 3), strides=2),
+        **pruning_params
+    )
+    x = stack_residual_block(pruned_conv_512, 256, n=8)
+
+    pruned_conv_1024 = sparsity.prune_low_magnitude(
+        conv2d_unit(x, 1024, (3, 3), strides=2),
+        **pruning_params
+    )
+    x = stack_residual_block(pruned_conv_1024, 512, n=4)
+
+    return x
+
+
+# High level: Defining Darknet-53 classifier
+def darknet():
+    
+    inputs = Input(shape=(416, 416, 3))
+    x = darknet_base(inputs)
+
+    x = GlobalAveragePooling2D()(x)
+    x = Dense(1000, activation='softmax')(x)
+
+    model = Model(inputs, x)
+
+    return model
+
+
+if __name__ == '__main__':
+    inputs = Input(shape=(416, 416, 3))
+    darknet_model = darknet_base(inputs)
+    original_model = Model(inputs, darknet_model)
+
+    original_model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
+
+    print(original_model.summary())
